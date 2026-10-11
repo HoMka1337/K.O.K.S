@@ -45,7 +45,7 @@
 |---|---|
 | Python | 3.10+ |
 | PyTorch | CUDA или CPU |
-| RAM | 8 ГБ |
+| RAM | 16 ГБ |
 | VRAM | 6 ГБ |
 | GPU | NVIDIA RTX 3050 Laptop или совместимый |
 | Дополнительно | `psutil` (опционально) |
