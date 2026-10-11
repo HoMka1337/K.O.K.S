@@ -1,4 +1,8 @@
+
 import json
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -11,97 +15,330 @@ from agent.semantics import (
 
 class Knowledge:
     def __init__(self, knowledge_path: Path):
-        self.knowledge_path = knowledge_path
+        self.knowledge_path = Path(knowledge_path)
         self.entries: List[Dict[str, str]] = []
         self._index: Optional[SemanticIndex] = None
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
-        if not self.knowledge_path.exists():
-            return
-        try:
-            data = json.loads(self.knowledge_path.read_text(encoding='utf-8'))
-            entries = data.get('entries', [])
-            if isinstance(entries, list):
-                self.entries = [e for e in entries if isinstance(e, dict)]
-        except (OSError, json.JSONDecodeError):
+        with self._lock:
             self.entries = []
+            self._index = None
+
+            if not self.knowledge_path.is_file():
+                return
+
+            try:
+                with self.knowledge_path.open(
+                    "r",
+                    encoding="utf-8"
+                ) as stream:
+                    data = json.load(stream)
+
+                if not isinstance(data, dict):
+                    return
+
+                entries = data.get("entries", [])
+
+                if not isinstance(entries, list):
+                    return
+
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+
+                    entry_type = entry.get("type")
+
+                    if entry_type == "text":
+                        content = entry.get("content", "")
+                        source = entry.get("source", "manual")
+
+                        if not isinstance(content, str):
+                            continue
+
+                        if not content.strip():
+                            continue
+
+                        self.entries.append({
+                            "type": "text",
+                            "source": str(source),
+                            "content": content.strip()
+                        })
+
+                    elif entry_type == "url":
+                        url = entry.get("url", "")
+
+                        if not isinstance(url, str):
+                            continue
+
+                        if not url.strip():
+                            continue
+
+                        self.entries.append({
+                            "type": "url",
+                            "url": url.strip()
+                        })
+
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError
+            ):
+                self.entries = []
 
     def _save(self) -> None:
-        self.knowledge_path.parent.mkdir(parents=True, exist_ok=True)
-        self.knowledge_path.write_text(
-            json.dumps({'entries': self.entries}, ensure_ascii=False, indent=2),
-            encoding='utf-8',
-        )
+        with self._lock:
+            self.knowledge_path.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            fd, temporary = tempfile.mkstemp(
+                prefix=".knowledge_",
+                suffix=".tmp",
+                dir=str(self.knowledge_path.parent)
+            )
+
+            try:
+                with os.fdopen(
+                    fd,
+                    "w",
+                    encoding="utf-8"
+                ) as stream:
+                    json.dump(
+                        {"entries": self.entries},
+                        stream,
+                        ensure_ascii=False,
+                        indent=2
+                    )
+
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+                os.replace(
+                    temporary,
+                    self.knowledge_path
+                )
+
+            finally:
+                Path(temporary).unlink(
+                    missing_ok=True
+                )
 
     def _invalidate_index(self) -> None:
-        self._index = None
+        with self._lock:
+            self._index = None
 
     def _ensure_index(self) -> SemanticIndex:
-        if self._index is None:
-            docs = []
-            for i, entry in enumerate(self.entries):
-                text = ' '.join(
-                    str(entry.get(k, '')) for k in ('content', 'source', 'url')
-                )
-                docs.append((str(i), text))
-            self._index = SemanticIndex(docs)
-        return self._index
+        with self._lock:
+            if self._index is None:
+                documents = []
+
+                for index, entry in enumerate(self.entries):
+                    content = entry.get("content", "")
+                    source = entry.get("source", "")
+                    url = entry.get("url", "")
+
+                    text = " ".join(
+                        value
+                        for value in (content, source, url)
+                        if isinstance(value, str) and value
+                    )
+
+                    documents.append(
+                        (str(index), text)
+                    )
+
+                self._index = SemanticIndex(documents)
+
+            return self._index
 
     def add_url(self, url: str) -> None:
-        if not any(entry.get('url') == url for entry in self.entries):
-            self.entries.append({'type': 'url', 'url': url})
+        if not isinstance(url, str):
+            return
+
+        url = url.strip()
+
+        if not url:
+            return
+
+        with self._lock:
+            for entry in self.entries:
+                if entry.get("url") == url:
+                    return
+
+            self.entries.append({
+                "type": "url",
+                "url": url
+            })
+
             self._save()
             self._invalidate_index()
 
-    def add_text(self, text: str, source: str = 'manual') -> None:
+    def add_text(
+        self,
+        text: str,
+        source: str = "manual"
+    ) -> None:
+        if not isinstance(text, str):
+            return
+
         text = text.strip()
+
         if not text:
             return
-        self.entries.append({'type': 'text', 'source': source, 'content': text})
-        self._save()
-        self._invalidate_index()
+
+        if not isinstance(source, str):
+            source = str(source)
+
+        source = source.strip() or "manual"
+
+        with self._lock:
+            for entry in self.entries:
+                if (
+                    entry.get("type") == "text"
+                    and entry.get("content") == text
+                    and entry.get("source") == source
+                ):
+                    return
+
+            self.entries.append({
+                "type": "text",
+                "source": source,
+                "content": text
+            })
+
+            self._save()
+            self._invalidate_index()
 
     def import_file(self, path: str) -> str:
-        file_path = Path(path)
-        if not file_path.is_file():
-            return f'Файл не найден: {path}'
         try:
-            self.add_text(file_path.read_text(encoding='utf-8'), str(file_path))
-            return f'Знания добавлены из файла: {path}'
-        except (OSError, UnicodeError) as error:
-            return f'Ошибка импорта знаний: {error}'
+            file_path = Path(path)
+        except (TypeError, ValueError):
+            return "Некорректный путь к файлу"
 
-    def search(self, query: str, limit: int = 1) -> str:
-        if not self.entries:
-            return ''
-        index = self._ensure_index()
-        result = index.best(query, min_score=0.4)
-        if result is None:
-            return ''
-        score, idx = result
-        entry = self.entries[idx]
-        content = entry.get('content') or entry.get('url') or ''
+        if not file_path.is_file():
+            return f"Файл не найден: {path}"
+
+        try:
+            text = file_path.read_text(
+                encoding="utf-8"
+            )
+
+            if not text.strip():
+                return f"Файл пустой: {path}"
+
+            self.add_text(
+                text,
+                str(file_path)
+            )
+
+            return f"Знания добавлены из файла: {path}"
+
+        except (OSError, UnicodeError, ValueError) as error:
+            return f"Ошибка импорта знаний: {error}"
+
+    def _entry_content(
+        self,
+        entry: Dict[str, str]
+    ) -> str:
+        content = entry.get("content", "")
+
+        if not isinstance(content, str):
+            return ""
+
         content = clean_answer(content)
+
         if not answer_looks_meaningful(content):
-            return ''
+            return ""
+
         return content
 
-    def search_many(self, query: str, limit: int = 3) -> List[str]:
-        if not self.entries:
+    def search(
+        self,
+        query: str,
+        limit: int = 1
+    ) -> str:
+        results = self.search_many(
+            query,
+            limit=limit
+        )
+
+        if not results:
+            return ""
+
+        return results[0]
+
+    def search_many(
+        self,
+        query: str,
+        limit: int = 3
+    ) -> List[str]:
+        if not isinstance(query, str):
             return []
-        index = self._ensure_index()
-        scored = []
-        for i in range(len(self.entries)):
-            s = index.score(query, i)
-            if s > 0.3:
-                scored.append((s, i))
-        scored.sort(reverse=True)
-        out = []
-        for _, idx in scored[:limit]:
-            entry = self.entries[idx]
-            content = entry.get('content') or entry.get('url') or ''
-            content = clean_answer(content)
-            if answer_looks_meaningful(content):
-                out.append(content)
-        return out
+
+        query = query.strip()
+
+        if not query:
+            return []
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            return []
+
+        if limit <= 0:
+            return []
+
+        with self._lock:
+            if not self.entries:
+                return []
+
+            index = self._ensure_index()
+            scored = []
+
+            for position, entry in enumerate(self.entries):
+                if entry.get("type") != "text":
+                    continue
+
+                score = index.score(
+                    query,
+                    position
+                )
+
+                if score > 0.3:
+                    scored.append(
+                        (score, position)
+                    )
+
+            scored.sort(
+                key=lambda item: (
+                    -item[0],
+                    -item[1]
+                )
+            )
+
+            results = []
+            seen = set()
+
+            for _, position in scored:
+                content = self._entry_content(
+                    self.entries[position]
+                )
+
+                if not content:
+                    continue
+
+                normalized = content.casefold()
+
+                if normalized in seen:
+                    continue
+
+                seen.add(normalized)
+                results.append(content)
+
+                if len(results) >= limit:
+                    break
+
+            return results

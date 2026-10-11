@@ -228,6 +228,7 @@ class Config:
     TOOLS_ENABLE_CODE = True
     TOOLS_ENABLE_WEB = True
     TOOLS_ENABLE_FILES = True
+    RAG_ENABLED = False
 
     SAFE_MODE = True
     CONFIRM_DANGEROUS = True
