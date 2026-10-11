@@ -1,0 +1,36 @@
+{
+  "goals": [
+    {
+      "text": "интересный факт об изобретениях",
+      "source": "bootstrap",
+      "priority": 1,
+      "created_at": 1791732924.4772272,
+      "done": true,
+      "result": "обработано: изобретениях"
+    },
+    {
+      "text": "что такое антибиотик",
+      "source": "bootstrap",
+      "priority": 1,
+      "created_at": 1791732924.4772272,
+      "done": false,
+      "result": ""
+    },
+    {
+      "text": "узнать что такое рекуррентная нейросеть",
+      "source": "bootstrap",
+      "priority": 1,
+      "created_at": 1791732924.4782598,
+      "done": false,
+      "result": ""
+    },
+    {
+      "text": "узнать что такое изобретениях",
+      "source": "curiosity",
+      "priority": 2,
+      "created_at": 1791732926.768093,
+      "done": true,
+      "result": "обработано: изобретениях"
+    }
+  ]
+}
