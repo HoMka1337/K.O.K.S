@@ -1,180 +1,673 @@
+
 import bz2
 import gzip
 import json
+import os
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterator, List, Dict, Optional
+from typing import Dict, Iterator, List
 
 from config import Config
 
 
 MIN_PARAGRAPH_CHARS = 80
 MAX_PARAGRAPH_CHARS = 2000
+
 SKIP_PREFIXES = (
-    "== См. также ==", "== Примечания ==", "== Литература ==",
-    "== Ссылки ==", "Категория:", "Файл:", "Шаблон:",
+    "Википедия:",
+    "Шаблон:",
+    "Категория:",
+    "Файл:",
+    "Участник:",
+    "Обсуждение:",
+    "Wikipedia:",
+    "Template:",
+    "Category:",
+    "File:",
+    "User:",
+    "Talk:"
+)
+
+SKIP_SECTIONS = (
+    "см. также",
+    "примечания",
+    "литература",
+    "ссылки",
+    "источники",
+    "библиография",
+    "see also",
+    "references",
+    "external links",
+    "further reading"
 )
 
 
 def _clean(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\{\{[^}]+\}\}", " ", text)
-    text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", text)
-    text = re.sub(r"'{2,}", "", text)
-    text = re.sub(r"\[http[^\]]+\]", " ", text)
-    text = re.sub(r"\s+", " ", text)
+    if not isinstance(text, str):
+        return ""
+
+    text = re.sub(
+        r"(?is)<!--.*?-->",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"(?is)<ref\b[^>]*>.*?</ref\s*>",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"(?is)<ref\b[^>]*/>",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"(?is)<(?:script|style|math)\b[^>]*>.*?</(?:script|style|math)\s*>",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\{\{[^{}]*\}\}",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\{\{[^{}]*\}\}",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]",
+        r"\1",
+        text
+    )
+
+    text = re.sub(
+        r"\[https?://[^\s\]]+\s+([^\]]+)\]",
+        r"\1",
+        text
+    )
+
+    text = re.sub(
+        r"\[https?://[^\]]+\]",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"(?is)<[^>]+>",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"'{2,}",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"(?m)^\s*[\*#;:]+\s*",
+        "",
+        text
+    )
+
+    text = text.replace(
+        "&nbsp;",
+        " "
+    )
+
+    text = text.replace(
+        "&amp;",
+        "&"
+    )
+
+    text = text.replace(
+        "&quot;",
+        '"'
+    )
+
+    text = text.replace(
+        "&lt;",
+        "<"
+    )
+
+    text = text.replace(
+        "&gt;",
+        ">"
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
     return text.strip()
 
 
-def iter_wiki_xml(path: Path) -> Iterator[Dict[str, str]]:
-    with bz2.open(path, "rb") as f:
-        context = ET.iterparse(f, events=("end",))
-        for event, elem in context:
-            if elem.tag.endswith("page"):
-                title_el = elem.find(".//{*}title")
-                text_el = elem.find(".//{*}revision/{*}text")
-                if title_el is not None and text_el is not None:
-                    title = title_el.text or ""
-                    body = text_el.text or ""
-                    if body and not title.startswith(("Википедия:", "Шаблон:", "Категория:")):
-                        yield {"title": title, "text": body}
-                elem.clear()
+def _local_name(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1]
 
 
-def iter_wiki_lines(path: Path) -> Iterator[Dict[str, str]]:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        title = None
-        for line in f:
-            line = line.rstrip("\n")
-            if not line:
-                continue
-            if title is None:
-                title = line
-            else:
-                yield {"title": title, "text": line}
+def _read_page_element(element):
+    title = ""
+    body = ""
+    namespace = "0"
+
+    for child in element:
+        name = _local_name(child.tag)
+
+        if name == "title":
+            title = child.text or ""
+
+        elif name == "ns":
+            namespace = (child.text or "").strip()
+
+        elif name == "revision":
+            for revision_child in child:
+                if _local_name(revision_child.tag) == "text":
+                    body = revision_child.text or ""
+
+    title = title.strip()
+
+    if not title or not body.strip():
+        return None
+
+    if namespace != "0":
+        return None
+
+    if title.casefold().startswith(
+        tuple(prefix.casefold() for prefix in SKIP_PREFIXES)
+    ):
+        return None
+
+    return {
+        "title": title,
+        "text": body
+    }
+
+
+def iter_wiki_xml(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+
+    opener = (
+        bz2.open
+        if path.name.casefold().endswith(".bz2")
+        else gzip.open
+        if path.name.casefold().endswith(".gz")
+        else open
+    )
+
+    try:
+        with opener(path, "rb") as stream:
+            context = ET.iterparse(
+                stream,
+                events=("start", "end")
+            )
+
+            root = None
+
+            for event, element in context:
+                if root is None and event == "start":
+                    root = element
+                    continue
+
+                if event != "end":
+                    continue
+
+                if _local_name(element.tag) != "page":
+                    continue
+
+                document = _read_page_element(element)
+
+                if document is not None:
+                    yield document
+
+                element.clear()
+
+                if root is not None:
+                    root.clear()
+
+    except (
+        OSError,
+        EOFError,
+        ET.ParseError
+    ):
+        return
+
+
+def iter_wiki_lines(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+
+    try:
+        with path.open(
+            "r",
+            encoding="utf-8",
+            errors="replace"
+        ) as stream:
+            title = None
+
+            for line in stream:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                if title is None:
+                    title = line
+                    continue
+
+                yield {
+                    "title": title,
+                    "text": line
+                }
+
                 title = None
 
-
-def iter_text(path: Path) -> Iterator[Dict[str, str]]:
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            buf = []
-            for line in f:
-                line = line.rstrip()
-                if not line and buf:
-                    yield {"title": path.stem, "text": " ".join(buf)}
-                    buf = []
-                else:
-                    buf.append(line)
-            if buf:
-                yield {"title": path.stem, "text": " ".join(buf)}
     except OSError:
         return
 
 
-def iter_gzip(path: Path) -> Iterator[Dict[str, str]]:
+def _iter_paragraph_stream(
+    stream,
+    title: str
+) -> Iterator[Dict[str, str]]:
+    buffer = []
+
+    for line in stream:
+        line = line.strip()
+
+        if not line:
+            if buffer:
+                yield {
+                    "title": title,
+                    "text": " ".join(buffer)
+                }
+
+                buffer = []
+
+            continue
+
+        buffer.append(line)
+
+    if buffer:
+        yield {
+            "title": title,
+            "text": " ".join(buffer)
+        }
+
+
+def iter_text(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+
     try:
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
-            buf = []
-            for line in f:
-                line = line.rstrip()
-                if not line and buf:
-                    yield {"title": path.stem, "text": " ".join(buf)}
-                    buf = []
-                else:
-                    buf.append(line)
-            if buf:
-                yield {"title": path.stem, "text": " ".join(buf)}
+        with path.open(
+            "r",
+            encoding="utf-8",
+            errors="replace"
+        ) as stream:
+            yield from _iter_paragraph_stream(
+                stream,
+                path.stem
+            )
+
     except OSError:
         return
 
 
-def iter_jsonl(path: Path) -> Iterator[Dict[str, str]]:
+def iter_gzip(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with gzip.open(
+            path,
+            "rt",
+            encoding="utf-8",
+            errors="replace"
+        ) as stream:
+            yield from _iter_paragraph_stream(
+                stream,
+                path.stem
+            )
+
+    except (OSError, EOFError):
+        return
+
+
+def iter_jsonl(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+
+    opener = (
+        gzip.open
+        if path.name.casefold().endswith(".gz")
+        else open
+    )
+
+    try:
+        with opener(
+            path,
+            "rt",
+            encoding="utf-8",
+            errors="replace"
+        ) as stream:
+            for line in stream:
+                line = line.strip()
+
+                if not line:
+                    continue
+
                 try:
-                    obj = json.loads(line)
+                    record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                title = obj.get("title") or obj.get("id") or path.stem
-                text = obj.get("text") or obj.get("content") or ""
-                if text:
-                    yield {"title": str(title), "text": str(text)}
-    except OSError:
+
+                if not isinstance(record, dict):
+                    continue
+
+                title = record.get(
+                    "title",
+                    record.get("id", path.stem)
+                )
+
+                text = record.get(
+                    "text",
+                    record.get("content", "")
+                )
+
+                if not isinstance(text, str):
+                    continue
+
+                if not text.strip():
+                    continue
+
+                yield {
+                    "title": str(title),
+                    "text": text
+                }
+
+    except (OSError, EOFError):
         return
 
 
-def iter_corpus(path: Path) -> Iterator[Dict[str, str]]:
-    suffix = path.suffix.lower()
-    name = path.name.lower()
-    if suffix == ".bz2" or name.endswith(".xml.bz2"):
+def iter_corpus(
+    path: Path
+) -> Iterator[Dict[str, str]]:
+    path = Path(path)
+    name = path.name.casefold()
+    suffix = path.suffix.casefold()
+
+    if name.endswith(
+        (".xml.bz2", ".xml.gz")
+    ):
         yield from iter_wiki_xml(path)
+
+    elif name.endswith(
+        (".jsonl.gz", ".ndjson.gz")
+    ):
+        yield from iter_jsonl(path)
+
+    elif suffix in (".jsonl", ".ndjson"):
+        yield from iter_jsonl(path)
+
+    elif suffix == ".xml":
+        yield from iter_wiki_xml(path)
+
+    elif suffix == ".bz2":
+        yield from iter_wiki_xml(path)
+
     elif suffix == ".gz":
         yield from iter_gzip(path)
-    elif suffix == ".jsonl" or suffix == ".ndjson":
-        yield from iter_jsonl(path)
-    elif suffix in (".xml", ".txt", ".md"):
-        if suffix == ".xml":
-            yield from iter_wiki_lines(path)
-        else:
-            yield from iter_text(path)
+
+    elif suffix in (".txt", ".md"):
+        yield from iter_text(path)
+
     else:
         yield from iter_text(path)
 
 
-def paragraphs_from_text(text: str) -> List[str]:
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    out = []
-    buf = []
-    size = 0
-    for s in parts:
-        buf.append(s)
-        size += len(s)
-        if size >= MIN_PARAGRAPH_CHARS:
-            chunk = " ".join(buf).strip()
-            if MIN_PARAGRAPH_CHARS <= len(chunk) <= MAX_PARAGRAPH_CHARS:
-                out.append(chunk)
-            buf = []
-            size = 0
-    if buf:
-        chunk = " ".join(buf).strip()
-        if MIN_PARAGRAPH_CHARS <= len(chunk) <= MAX_PARAGRAPH_CHARS:
-            out.append(chunk)
-    return out
+def paragraphs_from_text(
+    text: str
+) -> List[str]:
+    if not isinstance(text, str):
+        return []
+
+    text = text.strip()
+
+    if not text:
+        return []
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text
+    )
+
+    results = []
+    buffer = []
+    current_length = 0
+
+    def flush():
+        nonlocal buffer, current_length
+
+        if not buffer:
+            return
+
+        paragraph = " ".join(buffer).strip()
+
+        if (
+            MIN_PARAGRAPH_CHARS
+            <= len(paragraph)
+            <= MAX_PARAGRAPH_CHARS
+        ):
+            results.append(paragraph)
+
+        buffer = []
+        current_length = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+
+        if not sentence:
+            continue
+
+        if len(sentence) > MAX_PARAGRAPH_CHARS:
+            flush()
+
+            words = sentence.split()
+            chunk = []
+            chunk_length = 0
+
+            for word in words:
+                extra = len(word) + (
+                    1 if chunk else 0
+                )
+
+                if (
+                    chunk
+                    and chunk_length + extra > MAX_PARAGRAPH_CHARS
+                ):
+                    paragraph = " ".join(chunk)
+
+                    if len(paragraph) >= MIN_PARAGRAPH_CHARS:
+                        results.append(paragraph)
+
+                    chunk = []
+                    chunk_length = 0
+
+                if len(word) > MAX_PARAGRAPH_CHARS:
+                    continue
+
+                chunk.append(word)
+                chunk_length += len(word) + (
+                    1 if chunk_length else 0
+                )
+
+            if chunk:
+                paragraph = " ".join(chunk)
+
+                if len(paragraph) >= MIN_PARAGRAPH_CHARS:
+                    results.append(paragraph)
+
+            continue
+
+        extra = len(sentence) + (
+            1 if buffer else 0
+        )
+
+        if (
+            buffer
+            and current_length + extra > MAX_PARAGRAPH_CHARS
+        ):
+            flush()
+
+        buffer.append(sentence)
+        current_length += extra
+
+        if current_length >= MIN_PARAGRAPH_CHARS:
+            flush()
+
+    flush()
+
+    return results
 
 
-def build_corpus_jsonl(input_paths: List[Path], output_path: Path,
-                       max_docs: int = 0, max_chars: int = 0) -> int:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def build_corpus_jsonl(
+    input_paths: List[Path],
+    output_path: Path,
+    max_docs: int = 0,
+    max_chars: int = 0
+) -> int:
+    output_path = Path(output_path)
+
+    paths = [
+        Path(path)
+        for path in input_paths
+    ]
+
+    for path in paths:
+        if path.resolve() == output_path.resolve():
+            raise ValueError(
+                "Входной и выходной файл совпадают"
+            )
+
+    max_docs = max(0, int(max_docs))
+    max_chars = max(0, int(max_chars))
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".corpus_",
+        suffix=".tmp",
+        dir=str(output_path.parent)
+    )
+
+    temporary = Path(temporary_name)
+
     written = 0
     total_chars = 0
-    with open(output_path, "w", encoding="utf-8") as out:
-        for path in input_paths:
-            if not path.exists():
-                print(f"Пропущено (нет файла): {path}")
-                continue
-            print(f"Обработка: {path}")
-            for doc in iter_corpus(path):
-                title = doc.get("title", "")
-                text = _clean(doc.get("text", ""))
-                if len(text) < MIN_PARAGRAPH_CHARS:
+
+    try:
+        with os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8"
+        ) as output:
+            stop = False
+
+            for path in paths:
+                if stop:
+                    break
+
+                if not path.is_file():
                     continue
-                if any(p in title for p in SKIP_PREFIXES):
-                    continue
-                for para in paragraphs_from_text(text):
-                    if len(para) < MIN_PARAGRAPH_CHARS:
+
+                for document in iter_corpus(path):
+                    if not isinstance(document, dict):
                         continue
-                    record = {"title": title, "text": para}
-                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    written += 1
-                    total_chars += len(para)
-                    if max_docs and written >= max_docs:
-                        print(f"Достигнут лимит документов: {max_docs}")
-                        return written
-                    if max_chars and total_chars >= max_chars:
-                        print(f"Достигнут лимит символов: {max_chars}")
-                        return written
-    print(f"Готово. Документов: {written}, символов: {total_chars}")
-    return written
+
+                    title = document.get("title", "")
+                    text = document.get("text", "")
+
+                    if not isinstance(title, str):
+                        title = str(title)
+
+                    if not isinstance(text, str):
+                        continue
+
+                    title = title.strip()
+
+                    if title.casefold().startswith(
+                        tuple(
+                            prefix.casefold()
+                            for prefix in SKIP_PREFIXES
+                        )
+                    ):
+                        continue
+
+                    text = _clean(text)
+
+                    if len(text) < MIN_PARAGRAPH_CHARS:
+                        continue
+
+                    for paragraph in paragraphs_from_text(text):
+                        if max_docs and written >= max_docs:
+                            stop = True
+                            break
+
+                        if (
+                            max_chars
+                            and total_chars + len(paragraph) > max_chars
+                        ):
+                            stop = True
+                            break
+
+                        record = {
+                            "title": title,
+                            "text": paragraph
+                        }
+
+                        output.write(
+                            json.dumps(
+                                record,
+                                ensure_ascii=False
+                            ) + "\n"
+                        )
+
+                        written += 1
+                        total_chars += len(paragraph)
+
+            output.flush()
+            os.fsync(output.fileno())
+
+        os.replace(
+            temporary,
+            output_path
+        )
+
+        return written
+
+    finally:
+        temporary.unlink(
+            missing_ok=True
+        )

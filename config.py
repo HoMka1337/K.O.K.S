@@ -1,9 +1,12 @@
+
+import json
+import multiprocessing
 import os
 import platform
-import multiprocessing
-import shutil
-from pathlib import Path
+import re
 from datetime import datetime
+from pathlib import Path
+
 import torch
 
 
@@ -18,56 +21,85 @@ def _bytes_to_mb(value):
 def detect_device():
     info = {}
 
-    if torch.cuda.is_available():
-        device = "cuda"
-        gpu_count = torch.cuda.device_count()
-        gpu_name = torch.cuda.get_device_name(0)
-        props = torch.cuda.get_device_properties(0)
-        gpu_memory = _bytes_to_gb(props.total_memory)
+    try:
+        if torch.cuda.is_available():
+            properties = torch.cuda.get_device_properties(0)
 
-        info["gpu_count"] = gpu_count
-        info["gpu_name"] = gpu_name
-        info["gpu_memory_gb"] = round(gpu_memory, 2)
-        info["gpu_compute_capability"] = f"{props.major}.{props.minor}"
-        info["gpu_multi_processor_count"] = props.multi_processor_count
+            info = {
+                "gpu_count": torch.cuda.device_count(),
+                "gpu_name": torch.cuda.get_device_name(0),
+                "gpu_memory_gb": round(
+                    _bytes_to_gb(properties.total_memory),
+                    2
+                ),
+                "gpu_compute_capability": (
+                    f"{properties.major}.{properties.minor}"
+                ),
+                "gpu_multi_processor_count": (
+                    properties.multi_processor_count
+                ),
+                "device": "cuda"
+            }
 
-        print(f"NVIDIA GPU найден: {gpu_name}")
-        print(f"Видеопамять: {gpu_memory:.1f} GB")
-        if gpu_count > 1:
-            print(f"Обнаружено GPU: {gpu_count}")
-        print(f"Compute capability: {info['gpu_compute_capability']}")
+            return "cuda", info
 
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        device = "xpu"
-        info["xpu_name"] = torch.xpu.get_device_name(0)
-        print(f"Intel GPU найден: {info['xpu_name']}")
+        if (
+            hasattr(torch, "xpu")
+            and torch.xpu.is_available()
+        ):
+            info = {
+                "xpu_name": torch.xpu.get_device_name(0),
+                "device": "xpu"
+            }
 
-    elif hasattr(torch, "mps") and hasattr(torch.mps, "is_available") and torch.mps.is_available():
-        device = "mps"
-        info["mps"] = True
-        print("Apple MPS найден (Metal Performance Shaders)")
+            return "xpu", info
 
-    else:
-        device = "cpu"
-        info["cpu"] = True
-        print("Используется CPU")
+        if (
+            hasattr(torch, "backends")
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        ):
+            return "mps", {
+                "mps": True,
+                "device": "mps"
+            }
 
-    info["device"] = device
-    return device, info
+    except (
+        RuntimeError,
+        OSError,
+        AssertionError
+    ):
+        pass
+
+    return "cpu", {
+        "cpu": True,
+        "device": "cpu"
+    }
 
 
 DEVICE, DEVICE_INFO = detect_device()
 
 
 def detect_system_info():
-    total_ram = 0
-    available_ram = 0
+    total_ram = None
+    available_ram = None
+
     try:
         import psutil
-        vm = psutil.virtual_memory()
-        total_ram = _bytes_to_gb(vm.total)
-        available_ram = _bytes_to_gb(vm.available)
-    except Exception:
+
+        memory = psutil.virtual_memory()
+
+        total_ram = round(
+            _bytes_to_gb(memory.total),
+            2
+        )
+
+        available_ram = round(
+            _bytes_to_gb(memory.available),
+            2
+        )
+
+    except (ImportError, OSError):
         pass
 
     return {
@@ -81,10 +113,13 @@ def detect_system_info():
         "python_implementation": platform.python_implementation(),
         "cpu_count": multiprocessing.cpu_count(),
         "hostname": platform.node(),
-        "user": os.environ.get("USERNAME") or os.environ.get("USER") or "unknown",
+        "user": os.environ.get(
+            "USERNAME",
+            os.environ.get("USER", "unknown")
+        ),
         "cwd": str(Path.cwd()),
-        "total_ram_gb": round(total_ram, 2) if total_ram else None,
-        "available_ram_gb": round(available_ram, 2) if available_ram else None,
+        "total_ram_gb": total_ram,
+        "available_ram_gb": available_ram
     }
 
 
@@ -119,13 +154,14 @@ class Config:
 
     MAX_VRAM_GB = 4.5
     RESERVED_VRAM_GB = 1.5
+    MAX_RAM_GB = 5.0
+    RESERVED_RAM_GB = 1.5
+
     GRADIENT_ACCUMULATION_STEPS = 1
     USE_GRADIENT_CHECKPOINTING = False
     EMPTY_CACHE_EVERY_N_STEPS = 50
     MAX_CACHED_TEXTS = 2000
-    MAX_CACHED_TOKENS = 500_000
-    MAX_RAM_GB = 5.0
-    RESERVED_RAM_GB = 1.5
+    MAX_CACHED_TOKENS = 500000
 
     TEMPERATURE = 0.85
     TOP_K_GEN = 50
@@ -136,9 +172,16 @@ class Config:
 
     TOKENIZER_MIN_FREQ = 2
     TOKENIZER_MAX_VOCAB = 24000
-    TOKENIZER_SPECIAL_TOKENS = ["<PAD>", "<UNK>", "<BOS>", "<EOS>", "<SEP>"]
 
-    BASE_DIR = Path(__file__).parent
+    TOKENIZER_SPECIAL_TOKENS = (
+        "<PAD>",
+        "<UNK>",
+        "<BOS>",
+        "<EOS>",
+        "<SEP>"
+    )
+
+    BASE_DIR = Path(__file__).resolve().parent
     DATA_DIR = BASE_DIR / "data"
     MODELS_DIR = BASE_DIR / "models"
     LOGS_DIR = BASE_DIR / "logs"
@@ -178,6 +221,7 @@ class Config:
     DEVICE = DEVICE
     DEVICE_INFO = DEVICE_INFO
     SYSTEM_INFO = SYSTEM_INFO
+
     USE_AMP = DEVICE == "cuda"
     AMP_DTYPE = "bf16"
     PIN_MEMORY = DEVICE == "cuda"
@@ -204,16 +248,24 @@ class Config:
     DIALOG_MAX_ANSWER_LEN = 2000
     DIALOGS_MAX_PAIRS = 10000
 
+    RAG_ENABLED = False
+    RAG_TOP_K = 3
+
     WEB_TIMEOUT_SEC = 15
-    WEB_MAX_PAGE_BYTES = 500_000
+    WEB_MAX_PAGE_BYTES = 500000
     WEB_MAX_PAGE_CHARS = 30000
     WEB_SEARCH_LIMIT = 5
+
     WEB_USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     )
-    WEB_ACCEPT_LANGUAGE = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+
+    WEB_ACCEPT_LANGUAGE = (
+        "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+    )
+
     WEB_ACCEPT_ENCODING = "identity"
     WEB_RETRY_COUNT = 2
     WEB_RETRY_DELAY_SEC = 1.5
@@ -224,17 +276,18 @@ class Config:
     TOOLS_MAX_EXEC_TIME = 30
     TOOLS_MAX_PYTHON_TIME = 10
     TOOLS_MAX_OUTPUT_CHARS = 10000
+
     TOOLS_ENABLE_SYSTEM = True
     TOOLS_ENABLE_CODE = True
     TOOLS_ENABLE_WEB = True
     TOOLS_ENABLE_FILES = True
-    RAG_ENABLED = False
 
     SAFE_MODE = True
     CONFIRM_DANGEROUS = True
     REQUIRE_CONFIRMATION_CODE = True
     CONFIRMATION_CODE_LENGTH = 6
     ALLOW_DANGEROUS_ACTIONS = False
+
     READ_ONLY_MODE = False
     SANDBOX_MODE = True
     ALLOW_WRITE_OUTSIDE_BASE = False
@@ -243,24 +296,30 @@ class Config:
     ALLOW_CODE_EXECUTION = False
     ALLOW_NETWORK = True
     ALLOW_EXTERNAL_PATHS = False
+
     MAX_OPERATIONS_PER_MINUTE = 60
     MAX_DELETES_PER_SESSION = 50
     MAX_WRITES_PER_SESSION = 500
     MAX_COMMANDS_PER_SESSION = 20
     MAX_CODE_RUNS_PER_SESSION = 100
+
     LOCK_AFTER_SUSPICIOUS = True
     SUSPICIOUS_ACTIONS_TO_LOCK = 5
 
     ALLOWED_EXTENSIONS = (
-        ".txt", ".md", ".json", ".jsonl", ".yaml", ".yml",
-        ".py", ".js", ".ts", ".html", ".css", ".csv", ".log",
-        ".ini", ".cfg", ".conf", ".toml",
+        ".txt", ".md", ".json", ".jsonl",
+        ".yaml", ".yml", ".py", ".js",
+        ".ts", ".html", ".css", ".csv",
+        ".log", ".ini", ".cfg", ".conf",
+        ".toml"
     )
 
     FORBIDDEN_EXTENSIONS = (
-        ".exe", ".bat", ".cmd", ".com", ".msi", ".scr", ".pif",
-        ".dll", ".sys", ".drv", ".vbs", ".vbe", ".js", ".jse",
-        ".wsf", ".wsh", ".ps1", ".psm1", ".reg", ".lnk",
+        ".exe", ".bat", ".cmd", ".com",
+        ".msi", ".scr", ".pif", ".dll",
+        ".sys", ".drv", ".vbs", ".vbe",
+        ".jse", ".wsf", ".wsh", ".ps1",
+        ".psm1", ".reg", ".lnk"
     )
 
     FORBIDDEN_PATHS = (
@@ -273,124 +332,181 @@ class Config:
         "C:\\System Volume Information",
         "C:\\Users\\Default",
         "C:\\Users\\Public",
-        "C:\\Users\\All Users",
-        "C:\\PerfLogs",
         "C:\\Boot",
         "C:\\EFI",
-        "C:\\MSOCache",
-        "C:\\Intel",
-        "C:\\AMD",
-        "C:\\NVIDIA",
-        "/etc", "/usr", "/bin", "/sbin", "/boot", "/root",
-        "/var", "/opt", "/proc", "/sys", "/dev",
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/boot",
+        "/root",
+        "/var",
+        "/opt",
+        "/proc",
+        "/sys",
+        "/dev"
     )
 
     FORBIDDEN_PATH_PARTS = (
-        "system32", "syswow64", "winsxs", "windows",
-        "program files", "programdata",
-        "appdata\\local\\microsoft",
-        "appdata\\roaming\\microsoft",
+        "system32",
+        "syswow64",
+        "winsxs",
+        "program files",
+        "programdata",
         "system volume information",
-        "recycle.bin", "$recycle.bin",
-        "boot", "efi", "recovery",
-        "microsoft\\windows", "microsoft\\crypto",
-        "microsoft\\protect",
-        ".ssh", ".gnupg", ".aws", ".azure",
-        "id_rsa", "id_ed25519", ".env",
+        "$recycle.bin",
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".azure"
     )
 
     FORBIDDEN_FILENAMES = (
-        "ntuser.dat", "ntuser.ini", "boot.ini", "bcd",
-        "sam", "security", "software", "system",
-        "pagefile.sys", "hiberfil.sys", "swapfile.sys",
-        "hosts", "passwd", "shadow", "sudoers",
-        "id_rsa", "id_ed25519", "authorized_keys",
-        ".env", ".htaccess", ".gitconfig",
+        "ntuser.dat",
+        "ntuser.ini",
+        "boot.ini",
+        "bcd",
+        "sam",
+        "security",
+        "software",
+        "system",
+        "pagefile.sys",
+        "hiberfil.sys",
+        "swapfile.sys",
+        "hosts",
+        "passwd",
+        "shadow",
+        "sudoers",
+        "id_rsa",
+        "id_ed25519",
+        "authorized_keys",
+        ".env",
+        ".htaccess",
+        ".gitconfig"
     )
 
     DANGEROUS_PHRASES = (
-        "удали файл", "удали папку", "удали всё", "удали все",
-        "выполни команду", "выполни код",
-        "создай файл", "запиши файл", "перемести файл",
-        "скопируй файл", "переименуй файл",
-        "rm -rf", "rmdir /s", "rd /s", "del /f", "del /q",
-        "format", "fdisk", "diskpart", "mkfs",
-        "shutdown", "restart", "logoff",
-        "reg delete", "reg add", "sc delete", "sc stop",
-        "net user", "net localgroup", "net share",
-        "runas", "takeown", "icacls", "cacls",
-        "bcdedit", "bootrec", "sfc", "dism",
-        "taskkill", "wmic", "powershell -enc",
-        "curl | bash", "wget | sh", "iex(", "invoke-expression",
-        "> con", "nul", "dd if=", "dd of=",
-        "chmod 777", "chown root", "chattr",
-        "sudo", "su -", "passwd", "useradd", "userdel",
+        "удали файл",
+        "удали папку",
+        "удали всё",
+        "удали все",
+        "выполни команду",
+        "выполни код",
+        "создай файл",
+        "запиши файл",
+        "перемести файл",
+        "скопируй файл",
+        "переименуй файл",
+        "rm -rf",
+        "rmdir /s",
+        "rd /s",
+        "format",
+        "diskpart",
+        "shutdown",
+        "reg delete",
+        "net user",
+        "taskkill",
+        "bcdedit"
     )
 
     BLOCKED_COMMAND_MARKERS = (
-        "rm -rf", "rm -r", "rmdir /s", "rd /s",
-        "del /f", "del /q", "del /s",
-        "format ", "fdisk", "diskpart", "mkfs",
-        "shutdown", "restart", "logoff",
-        "reg delete", "reg add", "sc delete", "sc stop", "sc config",
-        "net user", "net localgroup", "net share",
-        "runas", "takeown", "icacls", "cacls",
-        "bcdedit", "bootrec", "sfc ", "dism ",
-        "taskkill", "wmic ", "powershell -enc", "powershell -e ",
-        "curl | bash", "curl | sh", "wget | bash", "wget | sh",
-        "iex(", "invoke-expression", "invoke-webrequest | iex",
-        "> con", "nul", "dd if=", "dd of=",
-        "chmod 777", "chown root", "chattr",
-        "sudo ", "su -", "passwd", "useradd", "userdel",
-        "& del", "& format", "&& del", "&& format",
-        "| del", "| format", "for /f", "forfiles",
-        "wevtutil cl", "cipher /w", "vssadmin delete",
-        "wbadmin delete", "bcdedit /delete",
+        "rm -rf",
+        "rm -r",
+        "rmdir /s",
+        "rd /s",
+        "del /f",
+        "del /q",
+        "del /s",
+        "format ",
+        "fdisk",
+        "diskpart",
+        "mkfs",
+        "shutdown",
+        "restart",
+        "logoff",
+        "reg delete",
+        "reg add",
+        "net user",
+        "runas",
+        "takeown",
+        "icacls",
+        "bcdedit",
+        "bootrec",
+        "taskkill",
+        "powershell -enc",
+        "invoke-expression",
+        "sudo ",
+        "su -",
+        "chmod 777"
     )
 
     BLOCKED_CODE_MARKERS = (
-        "shutil.rmtree", "os.remove", "os.rmdir", "os.unlink",
-        "os.system", "os.popen", "os.exec", "os.spawn",
-        "subprocess", "pty.spawn", "commands.getoutput",
-        "eval(", "exec(", "compile(", "__import__(",
-        "pickle.loads", "marshal.loads", "shelve.open",
-        "open('/etc", 'open("C:\\Windows',
-        'open("/etc', "open('C:\\Windows",
-        "requests.", "urllib", "httpx.", "aiohttp.",
-        "socket.socket", "telnetlib", "ftplib", "smtplib",
-        "sys.exit", "os._exit", "quit(", "exit(",
-        "globals()", "locals()", "vars(", "getattr(",
-        "setattr(", "delattr(", "__builtins__", "__subclasses__",
-        "ctypes", "cffi", "mmap", "resource.setrlimit",
-        "signal.alarm", "threading.Thread", "multiprocessing",
-        "tempfile.mktemp", "pathlib.Path.home",
-        "Path.home", "expanduser", "os.environ[",
+        "shutil.rmtree",
+        "os.remove",
+        "os.rmdir",
+        "os.unlink",
+        "os.system",
+        "os.popen",
+        "subprocess",
+        "eval(",
+        "exec(",
+        "compile(",
+        "__import__(",
+        "pickle.loads",
+        "marshal.loads",
+        "socket.socket",
+        "ctypes",
+        "cffi"
     )
 
     PROTECTED_ENV_VARS = (
-        "PATH", "PYTHONPATH", "SYSTEMROOT", "WINDIR",
-        "PROGRAMFILES", "PROGRAMDATA", "USERPROFILE",
-        "APPDATA", "LOCALAPPDATA", "TEMP", "TMP",
+        "PATH",
+        "PYTHONPATH",
+        "SYSTEMROOT",
+        "WINDIR",
+        "PROGRAMFILES",
+        "PROGRAMDATA",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "TEMP",
+        "TMP"
     )
 
     ALLOWED_WRITE_DIRS = (
-        "data", "models", "logs", "life", "cache", "tmp",
-        "backups", "sandbox", "quarantine", "web", "tests",
+        "data",
+        "models",
+        "logs",
+        "life",
+        "cache",
+        "tmp",
+        "backups",
+        "sandbox",
+        "quarantine",
+        "web",
+        "tests"
     )
 
-    ALLOWED_READ_DIRS = (
-        "data", "models", "logs", "life", "cache", "tmp",
-        "backups", "sandbox", "quarantine", "web", "tests",
-    )
+    ALLOWED_READ_DIRS = ALLOWED_WRITE_DIRS
 
     ALLOWED_DELETE_DIRS = (
-        "cache", "tmp", "sandbox", "quarantine",
+        "cache",
+        "tmp",
+        "sandbox",
+        "quarantine"
     )
 
     ALLOWED_COMMAND_PREFIXES = (
-        "dir", "ls", "type", "cat", "echo", "where", "which",
-        "python --version", "python -c \"print",
-        "pip list", "pip show",
+        "dir",
+        "ls",
+        "type",
+        "cat",
+        "echo",
+        "where",
+        "which",
+        "python --version",
+        "pip list",
+        "pip show"
     )
 
     LIFE_WEB_PAUSE_SEC = 25
@@ -398,7 +514,8 @@ class Config:
     LIFE_SLEEP_EVERY_STEPS = 1000
     LIFE_SLEEP_SEC = 60
     LIFE_MAX_STEPS_PER_SESSION = 500
-    LIFE_AUTOLEARN_EVERY = 0  # Enable only after reviewing validation and verified examples
+
+    LIFE_AUTOLEARN_EVERY = 0
     LIFE_AUTOLEARN_EPOCHS = 1
     LIFE_MAX_WEB_SEARCHES_PER_STEP = 1
     LIFE_MAX_PAGE_CHARS = 30000
@@ -415,6 +532,7 @@ class Config:
     LIFE_MAX_ANSWER_FOR_PAIR = 1500
     LIFE_MIN_ANSWER_FOR_PAIR = 60
     LIFE_MAX_TRAIN_TEXTS = 2000
+
     LIFE_SAFE_MODE = True
     LIFE_ALLOW_WRITES = True
     LIFE_ALLOW_DELETES = False
@@ -424,12 +542,15 @@ class Config:
 
     API_HOST = "127.0.0.1"
     API_PORT = 8765
-    API_MAX_BODY_BYTES = 500_000
-    API_CORS = True
+    API_MAX_BODY_BYTES = 65536
+    API_CORS = False
     API_ENABLE_WEB_UI = True
     API_REQUIRE_TOKEN = False
     API_TOKEN = ""
-    API_ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+    API_ALLOWED_HOSTS = (
+        "127.0.0.1",
+        "localhost"
+    )
 
     PLANNER_MAX_STEPS = 8
     PLANNER_SYSTEM_PROMPT_VERSION = "v2"
@@ -457,355 +578,604 @@ class Config:
             cls.TESTS_DIR,
             cls.BACKUP_DIR,
             cls.SANDBOX_DIR,
-            cls.QUARANTINE_DIR,
+            cls.QUARANTINE_DIR
         ]
 
     @classmethod
     def init(cls):
         for directory in cls._all_dirs():
-            directory.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
         if cls.DEVICE == "cuda":
-            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", cls.CUDA_ALLOC_CONF)
-        cls._log_security("Config initialized")
+            os.environ.setdefault(
+                "PYTORCH_CUDA_ALLOC_CONF",
+                cls.CUDA_ALLOC_CONF
+            )
+
+        cls._log_security(
+            "Config initialized"
+        )
 
     @classmethod
-    def _log_security(cls, message: str, level: str = "INFO"):
+    def _log_security(
+        cls,
+        message: str,
+        level: str = "INFO"
+    ):
         try:
-            cls.SECURITY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime(cls.DATETIME_FORMAT)
-            with open(cls.SECURITY_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{stamp} [{level}] {message}\n")
+            cls.SECURITY_LOG_FILE.parent.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            stamp = datetime.now().strftime(
+                cls.DATETIME_FORMAT
+            )
+
+            with cls.SECURITY_LOG_FILE.open(
+                "a",
+                encoding="utf-8"
+            ) as stream:
+                stream.write(
+                    f"{stamp} [{level}] {message}\n"
+                )
+
         except OSError:
             pass
 
     @classmethod
-    def is_dangerous(cls, text: str) -> bool:
-        if not text:
-            return False
-        low = text.lower()
-        return any(phrase in low for phrase in cls.DANGEROUS_PHRASES)
-
-    @classmethod
-    def normalize_path(cls, path) -> Path:
+    def normalize_path(cls, path):
         try:
-            return Path(path).expanduser().resolve(strict=False)
-        except (OSError, ValueError, RuntimeError):
+            candidate = Path(path).expanduser()
+
+            if not candidate.is_absolute():
+                candidate = cls.BASE_DIR / candidate
+
+            return candidate.resolve(
+                strict=False
+            )
+
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            RuntimeError
+        ):
             return None
 
     @classmethod
-    def is_forbidden_path(cls, path) -> bool:
-        resolved = cls.normalize_path(path)
-        if resolved is None:
-            return True
-        low = str(resolved).lower().replace("/", "\\")
-
-        for forbidden in cls.FORBIDDEN_PATHS:
-            if low.startswith(forbidden.lower().replace("/", "\\")):
-                return True
-        for part in cls.FORBIDDEN_PATH_PARTS:
-            if part.lower() in low:
-                return True
-        if resolved.name.lower() in {n.lower() for n in cls.FORBIDDEN_FILENAMES}:
-            return True
-        return False
-
-    @classmethod
     def is_within_base(cls, path) -> bool:
-        resolved = cls.normalize_path(path)
-        if resolved is None:
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
             return False
-        base = cls.BASE_DIR.resolve()
+
         try:
-            resolved.relative_to(base)
+            candidate.relative_to(
+                cls.BASE_DIR.resolve()
+            )
+
             return True
+
         except ValueError:
             return False
 
     @classmethod
-    def _is_in_allowed_dir(cls, path, allowed_dirs) -> bool:
-        resolved = cls.normalize_path(path)
-        if resolved is None:
+    def is_forbidden_path(cls, path) -> bool:
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
+            return True
+
+        if cls.is_within_base(candidate):
+            relative_parts = candidate.relative_to(
+                cls.BASE_DIR
+            ).parts
+        else:
+            relative_parts = candidate.parts
+
+        lowered_parts = {
+            part.casefold()
+            for part in relative_parts
+        }
+
+        if candidate.name.casefold() in {
+            name.casefold()
+            for name in cls.FORBIDDEN_FILENAMES
+        }:
+            return True
+
+        if any(
+            part in lowered_parts
+            for part in (
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".azure",
+                ".git"
+            )
+        ):
+            return True
+
+        if any(
+            part.startswith(".env")
+            for part in lowered_parts
+        ):
+            return True
+
+        if cls.is_within_base(candidate):
             return False
-        for name in allowed_dirs:
-            target = (cls.BASE_DIR / name).resolve()
-            try:
-                resolved.relative_to(target)
+
+        lowered = str(candidate).casefold().replace(
+            "/",
+            "\\"
+        )
+
+        for forbidden in cls.FORBIDDEN_PATHS:
+            prefix = forbidden.casefold().replace(
+                "/",
+                "\\"
+            ).rstrip("\\")
+
+            if (
+                lowered == prefix
+                or lowered.startswith(prefix + "\\")
+            ):
                 return True
+
+        for fragment in cls.FORBIDDEN_PATH_PARTS:
+            if fragment.casefold() in lowered:
+                return True
+
+        return False
+
+    @classmethod
+    def _is_in_allowed_dir(
+        cls,
+        path,
+        allowed_dirs
+    ) -> bool:
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
+            return False
+
+        for directory in allowed_dirs:
+            root = (
+                cls.BASE_DIR / directory
+            ).resolve()
+
+            try:
+                candidate.relative_to(root)
+                return True
+
             except ValueError:
                 continue
+
         return False
 
     @classmethod
     def can_read(cls, path) -> bool:
-        if cls.READ_ONLY_MODE and not cls.is_within_base(path):
+        if not cls.TOOLS_ENABLE_FILES:
             return False
-        if cls.is_forbidden_path(path):
+
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
             return False
-        if not cls.is_within_base(path):
-            return cls.ALLOW_EXTERNAL_PATHS and not cls.SANDBOX_MODE
-        return cls._is_in_allowed_dir(path, cls.ALLOWED_READ_DIRS) or cls.is_within_base(path)
+
+        if cls.is_forbidden_path(candidate):
+            return False
+
+        if cls.is_within_base(candidate):
+            return True
+
+        return (
+            cls.ALLOW_EXTERNAL_PATHS
+            and not cls.SANDBOX_MODE
+        )
 
     @classmethod
     def can_write(cls, path) -> bool:
-        if not cls.ALLOW_WRITE_OUTSIDE_BASE and not cls.is_within_base(path):
+        if cls.READ_ONLY_MODE:
             return False
-        if cls.is_forbidden_path(path):
+
+        if not cls.TOOLS_ENABLE_FILES:
             return False
-        ext = Path(str(path)).suffix.lower()
-        if ext and ext in cls.FORBIDDEN_EXTENSIONS:
+
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
             return False
-        if ext and cls.ALLOWED_EXTENSIONS and ext not in cls.ALLOWED_EXTENSIONS:
+
+        if cls.is_forbidden_path(candidate):
             return False
-        return cls._is_in_allowed_dir(path, cls.ALLOWED_WRITE_DIRS)
+
+        if not cls.is_within_base(candidate):
+            return False
+
+        extension = candidate.suffix.casefold()
+
+        if extension in cls.FORBIDDEN_EXTENSIONS:
+            return False
+
+        if (
+            extension
+            and extension not in cls.ALLOWED_EXTENSIONS
+        ):
+            return False
+
+        if candidate in {
+            cls.MEMORY_FILE,
+            cls.KNOWLEDGE_FILE,
+            cls.CONFIG_SNAPSHOT,
+            cls.SECURITY_STATE_FILE
+        }:
+            return True
+
+        return cls._is_in_allowed_dir(
+            candidate,
+            cls.ALLOWED_WRITE_DIRS
+        )
 
     @classmethod
     def can_delete(cls, path) -> bool:
+        if cls.READ_ONLY_MODE:
+            return False
+
         if not cls.ALLOW_DELETE_ANY:
             return False
-        if cls.is_forbidden_path(path):
+
+        candidate = cls.normalize_path(path)
+
+        if candidate is None:
             return False
-        if not cls.is_within_base(path):
+
+        if cls.is_forbidden_path(candidate):
             return False
-        return cls._is_in_allowed_dir(path, cls.ALLOWED_DELETE_DIRS)
+
+        if not cls.is_within_base(candidate):
+            return False
+
+        return cls._is_in_allowed_dir(
+            candidate,
+            cls.ALLOWED_DELETE_DIRS
+        )
 
     @classmethod
-    def can_execute_command(cls, command: str) -> bool:
+    def can_execute_command(
+        cls,
+        command: str
+    ) -> bool:
         if not cls.ALLOW_COMMAND_EXECUTION:
             return False
+
+        if not isinstance(command, str):
+            return False
+
+        command = command.strip()
+
         if not command:
             return False
-        low = command.lower().strip()
-        for marker in cls.BLOCKED_COMMAND_MARKERS:
-            if marker in low:
-                return False
-        if ";" in command or "&&" in command or "||" in command or "|" in command:
+
+        if len(command) > 4096:
             return False
-        if ">" in command or "<" in command:
+
+        if re.search(
+            r"[;&|<>`$\r\n]",
+            command
+        ):
             return False
-        if "`" in command or "$(" in command:
+
+        lowered = command.casefold()
+
+        if any(
+            marker in lowered
+            for marker in cls.BLOCKED_COMMAND_MARKERS
+        ):
             return False
-        first = low.split()[0] if low.split() else ""
-        if first and not any(low.startswith(prefix) for prefix in cls.ALLOWED_COMMAND_PREFIXES):
-            return False
-        return True
+
+        allowed = (
+            "dir",
+            "ls",
+            "type",
+            "cat",
+            "echo",
+            "where",
+            "which",
+            "python --version",
+            "pip list",
+            "pip show"
+        )
+
+        return any(
+            lowered == prefix
+            or lowered.startswith(prefix + " ")
+            for prefix in allowed
+        )
 
     @classmethod
-    def can_execute_code(cls, code: str) -> bool:
+    def can_execute_code(
+        cls,
+        code: str
+    ) -> bool:
         if not cls.ALLOW_CODE_EXECUTION:
             return False
-        if not code:
+
+        if not isinstance(code, str):
             return False
-        low = code.lower()
-        for marker in cls.BLOCKED_CODE_MARKERS:
-            if marker.lower() in low:
-                return False
-        if "import os" in low and ("system" in low or "popen" in low):
+
+        if not code.strip():
             return False
-        if "__" in code and "import" in low:
-            return False
-        return True
+
+        lowered = code.casefold()
+
+        return not any(
+            marker.casefold() in lowered
+            for marker in cls.BLOCKED_CODE_MARKERS
+        )
 
     @classmethod
     def can_use_network(cls) -> bool:
-        return cls.ALLOW_NETWORK
+        return bool(
+            cls.ALLOW_NETWORK
+            and cls.TOOLS_ENABLE_WEB
+        )
 
     @classmethod
     def is_path_allowed(cls, path) -> bool:
         return cls.can_write(path)
 
     @classmethod
+    def is_dangerous(
+        cls,
+        text: str
+    ) -> bool:
+        if not isinstance(text, str):
+            return False
+
+        lowered = text.casefold()
+
+        return any(
+            phrase in lowered
+            for phrase in cls.DANGEROUS_PHRASES
+        )
+
+    @classmethod
     def estimate_model_size_mb(cls):
-        params = (
+        parameters = (
             cls.VOCAB_SIZE * cls.D_MODEL
-            + cls.MAX_LEN * cls.D_MODEL
             + cls.N_LAYERS * (
                 4 * cls.D_MODEL * cls.D_MODEL
                 + 2 * cls.D_MODEL * cls.D_FF
             )
             + cls.D_MODEL * cls.VOCAB_SIZE
         )
-        return round(params * 4 / (1024 ** 2), 1)
+
+        return round(
+            parameters * 4 / (1024 ** 2),
+            1
+        )
 
     @classmethod
     def estimate_training_peak_mb(cls):
-        params_mb = cls.estimate_model_size_mb()
+        parameters = cls.estimate_model_size_mb()
+
         activations = (
-            cls.TRAIN_BATCH_SIZE * cls.TRAIN_MAX_LEN
-            * cls.N_LAYERS * cls.D_MODEL * 20
+            cls.TRAIN_BATCH_SIZE
+            * cls.TRAIN_MAX_LEN
+            * cls.N_LAYERS
+            * cls.D_MODEL
+            * 20
+        ) * 4 / (1024 ** 2)
+
+        return round(
+            parameters * 4 + activations,
+            1
         )
-        activations_mb = activations * 4 / (1024 ** 2)
-        optim = params_mb * 3
-        return round(params_mb + activations_mb + optim, 1)
 
     @classmethod
     def estimate_inference_peak_mb(cls):
-        params_mb = cls.estimate_model_size_mb()
+        parameters = cls.estimate_model_size_mb()
+
         activations = (
-            1 * cls.MAX_LEN * cls.N_LAYERS * cls.D_MODEL * 20
+            cls.MAX_LEN
+            * cls.N_LAYERS
+            * cls.D_MODEL
+            * 20
+        ) * 4 / (1024 ** 2)
+
+        return round(
+            parameters + activations,
+            1
         )
-        activations_mb = activations * 4 / (1024 ** 2)
-        return round(params_mb + activations_mb, 1)
 
     @classmethod
     def estimate_free_vram_after_training(cls):
-        total = cls.DEVICE_INFO.get("gpu_memory_gb") or 6.0
-        peak_gb = cls.estimate_training_peak_mb() / 1024
-        return round(total - peak_gb, 2)
+        total = (
+            cls.DEVICE_INFO.get("gpu_memory_gb")
+            or 6.0
+        )
+
+        return round(
+            total - cls.estimate_training_peak_mb() / 1024,
+            2
+        )
 
     @classmethod
     def estimate_free_ram_after_training(cls):
-        total = cls.SYSTEM_INFO.get("total_ram_gb") or 8.0
-        peak_gb = cls.estimate_training_peak_mb() / 1024
-        return round(total - peak_gb, 2)
+        total = (
+            cls.SYSTEM_INFO.get("total_ram_gb")
+            or 8.0
+        )
+
+        return round(
+            total - cls.estimate_training_peak_mb() / 1024,
+            2
+        )
 
     @classmethod
     def snapshot(cls):
-        out = {}
+        result = {}
+
         for key in dir(cls):
             if key.startswith("_"):
                 continue
+
             value = getattr(cls, key)
+
             if callable(value):
                 continue
+
             if isinstance(value, Path):
                 value = str(value)
-            if isinstance(value, tuple):
+
+            elif isinstance(value, (tuple, set)):
                 value = list(value)
-            if isinstance(value, set):
-                value = list(value)
-            try:
-                out[key] = value
-            except Exception:
-                out[key] = repr(value)
-        out["snapshot_time"] = datetime.now().isoformat()
-        out["model_size_mb"] = cls.estimate_model_size_mb()
-        out["training_peak_mb"] = cls.estimate_training_peak_mb()
-        out["inference_peak_mb"] = cls.estimate_inference_peak_mb()
-        out["free_ram_after_training_gb"] = cls.estimate_free_ram_after_training()
-        out["free_vram_after_training_gb"] = cls.estimate_free_vram_after_training()
-        return out
+
+            result[key] = value
+
+        result["snapshot_time"] = datetime.now().isoformat()
+        result["model_size_mb"] = cls.estimate_model_size_mb()
+        result["training_peak_mb"] = cls.estimate_training_peak_mb()
+        result["inference_peak_mb"] = cls.estimate_inference_peak_mb()
+
+        return result
 
     @classmethod
     def save_snapshot(cls):
-        import json
         try:
-            cls.CONFIG_SNAPSHOT.write_text(
-                json.dumps(cls.snapshot(), ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
+            cls.CONFIG_SNAPSHOT.parent.mkdir(
+                parents=True,
+                exist_ok=True
             )
-        except OSError:
-            pass
+
+            cls.CONFIG_SNAPSHOT.write_text(
+                json.dumps(
+                    cls.snapshot(),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str
+                ),
+                encoding="utf-8"
+            )
+
+            return True
+
+        except (OSError, TypeError, ValueError):
+            return False
 
     @classmethod
     def summary(cls):
-        lines = [
+        return "\n".join([
             f"Device: {cls.DEVICE}",
             f"CPU count: {cls.SYSTEM_INFO.get('cpu_count')}",
             f"Python: {cls.SYSTEM_INFO.get('python_version')}",
             f"Platform: {cls.SYSTEM_INFO.get('platform')}",
             f"Base dir: {cls.BASE_DIR}",
-            f"Model: d_model={cls.D_MODEL}, n_layers={cls.N_LAYERS}, "
-            f"n_heads={cls.N_HEADS}, vocab={cls.VOCAB_SIZE}",
+            f"Model: d_model={cls.D_MODEL}, n_layers={cls.N_LAYERS}, n_heads={cls.N_HEADS}, vocab={cls.VOCAB_SIZE}",
             f"Model size: ~{cls.estimate_model_size_mb()} MB",
             f"Training peak: ~{cls.estimate_training_peak_mb()} MB",
             f"Inference peak: ~{cls.estimate_inference_peak_mb()} MB",
-            f"Free VRAM after training: ~{cls.estimate_free_vram_after_training()} GB",
-            f"Free RAM after training: ~{cls.estimate_free_ram_after_training()} GB",
-            f"VRAM limit: {cls.MAX_VRAM_GB} GB (reserved {cls.RESERVED_VRAM_GB} GB)",
-            f"RAM limit: {cls.MAX_RAM_GB} GB (reserved {cls.RESERVED_RAM_GB} GB)",
-            f"AMP: {cls.USE_AMP} ({cls.AMP_DTYPE})",
+            f"AMP: {cls.USE_AMP}",
             f"Safe mode: {cls.SAFE_MODE}",
             f"Sandbox: {cls.SANDBOX_MODE}",
             f"Read-only: {cls.READ_ONLY_MODE}",
             f"Allow commands: {cls.ALLOW_COMMAND_EXECUTION}",
             f"Allow code: {cls.ALLOW_CODE_EXECUTION}",
-            f"Allow deletes: {cls.ALLOW_DELETE_ANY}",
-            f"Allow network: {cls.ALLOW_NETWORK}",
-        ]
-        if cls.SYSTEM_INFO.get("total_ram_gb"):
-            lines.append(
-                f"Total RAM: {cls.SYSTEM_INFO['total_ram_gb']} GB "
-                f"(available: {cls.SYSTEM_INFO.get('available_ram_gb')} GB)"
-            )
-        if cls.DEVICE_INFO.get("gpu_name"):
-            lines.append(
-                f"GPU: {cls.DEVICE_INFO['gpu_name']} "
-                f"({cls.DEVICE_INFO.get('gpu_memory_gb')} GB)"
-            )
-        return "\n".join(lines)
+            f"Allow network: {cls.ALLOW_NETWORK}"
+        ])
 
     @classmethod
     def validate(cls):
         errors = []
+
         if cls.D_MODEL % cls.N_HEADS != 0:
-            errors.append("D_MODEL must be divisible by N_HEADS")
-        if cls.TRAIN_BATCH_SIZE < 1:
-            errors.append("TRAIN_BATCH_SIZE must be >= 1")
-        if cls.LEARNING_RATE <= 0:
-            errors.append("LEARNING_RATE must be > 0")
-        if cls.MAX_LEN < cls.TRAIN_MAX_LEN:
-            errors.append("MAX_LEN must be >= TRAIN_MAX_LEN")
-        if cls.VOCAB_SIZE < len(cls.TOKENIZER_SPECIAL_TOKENS):
-            errors.append("VOCAB_SIZE too small for special tokens")
-        if cls.LIFE_MAX_STEPS_PER_SESSION < 1:
-            errors.append("LIFE_MAX_STEPS_PER_SESSION must be >= 1")
-        if cls.LIFE_AUTOLEARN_EVERY < 0:
-            errors.append("LIFE_AUTOLEARN_EVERY must be >= 0")
-
-        peak = cls.estimate_training_peak_mb()
-
-        if cls.DEVICE == "cuda":
-            vram_total = (cls.DEVICE_INFO.get("gpu_memory_gb") or 6.0) * 1024
-            vram_limit = vram_total - cls.RESERVED_VRAM_GB * 1024
-            if peak > vram_limit:
-                errors.append(
-                    f"Training peak ~{peak} MB exceeds available VRAM after "
-                    f"reserve ({vram_limit:.0f} MB). Уменьши TRAIN_BATCH_SIZE, "
-                    f"D_MODEL или N_LAYERS."
-                )
-
-        ram_total = (cls.SYSTEM_INFO.get("total_ram_gb") or 8.0) * 1024
-        ram_limit = ram_total - cls.RESERVED_RAM_GB * 1024
-        if peak > ram_limit:
             errors.append(
-                f"Training peak ~{peak} MB exceeds available RAM after "
-                f"reserve ({ram_limit:.0f} MB)."
+                "D_MODEL must be divisible by N_HEADS"
             )
+
+        if cls.TRAIN_BATCH_SIZE < 1:
+            errors.append(
+                "TRAIN_BATCH_SIZE must be >= 1"
+            )
+
+        if cls.LEARNING_RATE <= 0:
+            errors.append(
+                "LEARNING_RATE must be > 0"
+            )
+
+        if cls.TRAIN_MAX_LEN > cls.MAX_LEN:
+            errors.append(
+                "TRAIN_MAX_LEN exceeds MAX_LEN"
+            )
+
+        if cls.VOCAB_SIZE < len(
+            cls.TOKENIZER_SPECIAL_TOKENS
+        ):
+            errors.append(
+                "VOCAB_SIZE too small"
+            )
+
+        if cls.LIFE_MAX_STEPS_PER_SESSION < 1:
+            errors.append(
+                "LIFE_MAX_STEPS_PER_SESSION must be positive"
+            )
+
+        if cls.LIFE_AUTOLEARN_EVERY < 0:
+            errors.append(
+                "LIFE_AUTOLEARN_EVERY cannot be negative"
+            )
+
         return errors
 
     @classmethod
     def memory_report(cls):
         lines = []
+
         try:
             import psutil
-            vm = psutil.virtual_memory()
+
+            memory = psutil.virtual_memory()
+            process = psutil.Process()
+
             lines.append(
-                f"RAM total: {_bytes_to_gb(vm.total):.2f} GB, "
-                f"available: {_bytes_to_gb(vm.available):.2f} GB, "
-                f"used: {vm.percent}%, "
-                f"process RSS: {_bytes_to_mb(psutil.Process().memory_info().rss):.0f} MB"
+                f"RAM total: {_bytes_to_gb(memory.total):.2f} GB, "
+                f"available: {_bytes_to_gb(memory.available):.2f} GB, "
+                f"used: {memory.percent}%, "
+                f"process RSS: {_bytes_to_mb(process.memory_info().rss):.0f} MB"
             )
-        except Exception:
-            lines.append("psutil not available")
+
+        except (ImportError, OSError):
+            lines.append(
+                "Информация о памяти недоступна"
+            )
+
         if cls.DEVICE == "cuda" and torch.cuda.is_available():
             try:
-                allocated = torch.cuda.memory_allocated() / (1024 ** 2)
-                reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+                allocated = torch.cuda.memory_allocated()
+                reserved = torch.cuda.memory_reserved()
                 free, total = torch.cuda.mem_get_info()
+
                 lines.append(
-                    f"VRAM allocated: {allocated:.0f} MB, "
-                    f"reserved: {reserved:.0f} MB, "
+                    f"VRAM allocated: {_bytes_to_mb(allocated):.0f} MB, "
+                    f"reserved: {_bytes_to_mb(reserved):.0f} MB, "
                     f"free: {_bytes_to_gb(free):.2f} GB / "
                     f"{_bytes_to_gb(total):.2f} GB"
                 )
-            except Exception as error:
-                lines.append(f"CUDA memory info error: {error}")
+
+            except (RuntimeError, OSError):
+                pass
+
         return "\n".join(lines)
 
     @classmethod
     def security_report(cls):
-        lines = [
-            "=== SECURITY ===",
+        return "\n".join([
+            "SECURITY",
             f"SAFE_MODE: {cls.SAFE_MODE}",
             f"SANDBOX_MODE: {cls.SANDBOX_MODE}",
             f"READ_ONLY_MODE: {cls.READ_ONLY_MODE}",
@@ -821,6 +1191,5 @@ class Config:
             f"MAX_DELETES_PER_SESSION: {cls.MAX_DELETES_PER_SESSION}",
             f"MAX_WRITES_PER_SESSION: {cls.MAX_WRITES_PER_SESSION}",
             f"MAX_COMMANDS_PER_SESSION: {cls.MAX_COMMANDS_PER_SESSION}",
-            f"MAX_CODE_RUNS_PER_SESSION: {cls.MAX_CODE_RUNS_PER_SESSION}",
-        ]
-        return "\n".join(lines)
+            f"MAX_CODE_RUNS_PER_SESSION: {cls.MAX_CODE_RUNS_PER_SESSION}"
+        ])
