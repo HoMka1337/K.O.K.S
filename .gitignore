@@ -1,0 +1,13 @@
+/backups
+/cache
+/config_snapshot.json
+/data
+/knowledge.json
+/memory.json
+/models
+/quarantine
+/sandbox
+/tests
+/tmp
+/tokenizer.json
+/__pycache__
